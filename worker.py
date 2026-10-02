@@ -1,3 +1,5 @@
+import argparse
+import base64
 import os
 import subprocess
 import tempfile
@@ -9,343 +11,203 @@ from faster_whisper import WhisperModel
 
 API_BASE_URL = os.environ["CLIPVIRAL_API_URL"].rstrip("/")
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "5"))
-MODEL_NAME = os.getenv("WHISPER_MODEL", "small")
-MAX_CLIPS = int(os.getenv("MAX_CLIPS", "3"))
+MODEL_NAME = os.getenv("WHISPER_MODEL", "base")
+MAX_CLIPS = int(os.getenv("MAX_CLIPS", "1"))
+CLIP_SECONDS = int(os.getenv("CLIP_SECONDS", "20"))
+OUTPUT_WIDTH = int(os.getenv("OUTPUT_WIDTH", "720"))
+OUTPUT_HEIGHT = int(os.getenv("OUTPUT_HEIGHT", "1280"))
 
 SESSION = requests.Session()
 MODEL = None
 
 
 def callback(job_id, payload):
-    response = SESSION.post(
-        f"{API_BASE_URL}/api/jobs/{job_id}/callback",
-        json=payload,
-        timeout=60,
+    r = SESSION.post(f"{API_BASE_URL}/api/jobs/{job_id}/callback",
+                     json=payload, timeout=60)
+    r.raise_for_status()
+
+
+def upload_clip(job_id, clip_id, output):
+    encoded = base64.b64encode(Path(output).read_bytes()).decode("ascii")
+    r = SESSION.post(
+        f"{API_BASE_URL}/api/jobs/{job_id}/upload-clip",
+        json={
+            "clipId": clip_id,
+            "fileName": f"clip-{clip_id}.mp4",
+            "contentBase64": encoded,
+            "contentType": "video/mp4",
+        },
+        timeout=180,
     )
-    response.raise_for_status()
+    r.raise_for_status()
+    return r.json()["downloadUrl"]
 
 
 def run(command):
     return subprocess.run(
-        command,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+        command, check=True, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True
     )
 
 
 def download_source(source, workdir):
     if not source.startswith(("http://", "https://")):
-        raise RuntimeError(
-            "Direct uploaded-file processing is not enabled yet. "
-            "Use a YouTube or Twitch URL."
-        )
-
+        raise RuntimeError("Use a YouTube or Twitch URL for the free prototype.")
     output = str(Path(workdir) / "source.%(ext)s")
-
     run([
-        "yt-dlp",
-        "--no-playlist",
-        "-f", "bv*+ba/b",
-        "--merge-output-format", "mp4",
-        "-o", output,
-        source,
+        "yt-dlp", "--no-playlist", "-f", "bv*+ba/b",
+        "--merge-output-format", "mp4", "-o", output, source
     ])
-
     files = list(Path(workdir).glob("source.*"))
     if not files:
-        raise RuntimeError("yt-dlp completed but no media file was produced.")
-
+        raise RuntimeError("No media file was produced.")
     return str(files[0])
 
 
 def transcribe(media):
     global MODEL
-
     if MODEL is None:
-        MODEL = WhisperModel(
-            MODEL_NAME,
-            device="cpu",
-            compute_type="int8",
-        )
-
-    segments, _ = MODEL.transcribe(
-        media,
-        vad_filter=True,
-        word_timestamps=True,
-    )
-
+        MODEL = WhisperModel(MODEL_NAME, device="cpu", compute_type="int8")
+    segments, _ = MODEL.transcribe(media, vad_filter=True, word_timestamps=True)
     return list(segments)
 
 
 def score_segments(segments):
-    hook_words = {
-        "secret",
-        "mistake",
-        "why",
-        "how",
-        "truth",
-        "never",
-        "always",
-        "best",
-        "worst",
-        "problem",
-        "learn",
-        "important",
-        "shocking",
-        "actually",
-        "because",
-        "instead",
-        "stop",
-        "start",
+    hooks = {
+        "secret", "mistake", "why", "how", "truth", "never", "always",
+        "best", "worst", "problem", "learn", "important", "shocking",
+        "actually", "because", "instead", "stop", "start"
     }
-
     candidates = []
-
     for index, segment in enumerate(segments):
         text = segment.text.strip()
-
         if not text:
             continue
-
         words = text.split()
         lower = text.lower()
-
         score = 45
-        score += min(25, sum(5 for word in hook_words if word in lower))
+        score += min(25, sum(5 for w in hooks if w in lower))
         score += min(20, max(0, len(words) - 8))
-
         if "?" in text:
             score += 8
-
-        candidates.append(
-            (
-                min(99, score),
-                index,
-                segment,
-            )
-        )
-
-    candidates.sort(
-        reverse=True,
-        key=lambda item: item[0],
-    )
-
+        candidates.append((min(99, score), index, segment))
+    candidates.sort(reverse=True, key=lambda x: x[0])
     return candidates[:MAX_CLIPS]
 
 
 def render_clip(media, start, end, output):
-    duration = max(8.0, min(60.0, end - start))
-
-    video_filter = (
-        "scale=1080:1920:force_original_aspect_ratio=increase,"
-        "crop=1080:1920,"
-        "setsar=1"
+    duration = max(8.0, min(float(CLIP_SECONDS), end - start))
+    vf = (
+        f"scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:"
+        "force_original_aspect_ratio=increase,"
+        f"crop={OUTPUT_WIDTH}:{OUTPUT_HEIGHT},setsar=1"
     )
-
     run([
-        "ffmpeg",
-        "-y",
-        "-ss",
-        str(start),
-        "-i",
-        media,
-        "-t",
-        str(duration),
-        "-vf",
-        video_filter,
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "23",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-movflags",
-        "+faststart",
-        output,
+        "ffmpeg", "-y", "-ss", str(start), "-i", media,
+        "-t", str(duration), "-vf", vf,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+        "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", output
     ])
 
 
 def process(job):
     job_id = job["jobId"]
-    source = job["source"]
+    with tempfile.TemporaryDirectory(prefix=f"clipviral-{job_id}-") as workdir:
+        callback(job_id, {
+            "status": "processing", "progress": 15, "step": 1,
+            "message": "Downloading source video..."
+        })
+        media = download_source(job["source"], workdir)
 
-    with tempfile.TemporaryDirectory(
-        prefix=f"clipviral-{job_id}-"
-    ) as workdir:
-
-        callback(
-            job_id,
-            {
-                "status": "processing",
-                "progress": 15,
-                "step": 1,
-                "message": "Downloading source video...",
-            },
-        )
-
-        media = download_source(source, workdir)
-
-        callback(
-            job_id,
-            {
-                "status": "processing",
-                "progress": 35,
-                "step": 2,
-                "message": "Transcribing with Whisper...",
-            },
-        )
-
+        callback(job_id, {
+            "status": "processing", "progress": 35, "step": 2,
+            "message": f"Transcribing with Whisper ({MODEL_NAME})..."
+        })
         segments = transcribe(media)
-
         if not segments:
-            raise RuntimeError(
-                "No speech was detected in the source video."
-            )
+            raise RuntimeError("No speech was detected.")
 
-        callback(
-            job_id,
-            {
-                "status": "processing",
-                "progress": 55,
-                "step": 2,
-                "message": "Finding high-retention moments...",
-            },
-        )
-
+        callback(job_id, {
+            "status": "processing", "progress": 55, "step": 2,
+            "message": "Finding a high-retention moment..."
+        })
         picks = score_segments(segments)
+        if not picks:
+            raise RuntimeError("No usable clip candidate was detected.")
 
         clips = []
+        for number, (score, _, segment) in enumerate(picks, start=1):
+            start = max(0.0, float(segment.start) - 3.0)
+            end = min(float(segments[-1].end), start + CLIP_SECONDS)
+            output = str(Path(workdir) / f"clip-{number}.mp4")
 
-        for clip_number, (score, _, segment) in enumerate(
-            picks,
-            start=1,
-        ):
-            start = max(
-                0.0,
-                float(segment.start) - 3.0,
-            )
+            callback(job_id, {
+                "status": "processing", "progress": 60, "step": 3,
+                "message": f"Rendering clip {number}..."
+            })
+            render_clip(media, start, end, output)
 
-            end = min(
-                float(segments[-1].end),
-                start + 45.0,
-            )
+            callback(job_id, {
+                "status": "processing", "progress": 85, "step": 4,
+                "message": "Saving rendered clip..."
+            })
+            url = upload_clip(job_id, number, output)
 
-            output = str(
-                Path(workdir) / f"clip-{clip_number}.mp4"
-            )
+            clips.append({
+                "id": number,
+                "title": segment.text.strip()[:90],
+                "viralScore": int(score),
+                "duration": f"{int(end-start)//60:02d}:{int(end-start)%60:02d}",
+                "reason": "Transcript hook and conversational density detected.",
+                "subtitle": segment.text.strip()[:120].upper(),
+                "tone": "Hook",
+                "status": "rendered",
+                "downloadUrl": url,
+            })
 
-            callback(
-                job_id,
-                {
-                    "status": "processing",
-                    "progress": 60 + clip_number * 10,
-                    "step": 3,
-                    "message": (
-                        f"Rendering clip {clip_number} "
-                        f"of {len(picks)}..."
-                    ),
-                },
-            )
+        callback(job_id, {
+            "status": "completed", "progress": 100, "step": 4,
+            "message": "Your clip is ready.", "clips": clips
+        })
 
-            render_clip(
-                media,
-                start,
-                end,
-                output,
-            )
 
-            clips.append(
-                {
-                    "id": clip_number,
-                    "title": segment.text.strip()[:90],
-                    "viralScore": int(score),
-                    "duration": (
-                        f"{int(end - start) // 60:02d}:"
-                        f"{int(end - start) % 60:02d}"
-                    ),
-                    "reason": (
-                        "Transcript hook and "
-                        "conversational density detected."
-                    ),
-                    "subtitle": (
-                        segment.text.strip()[:120].upper()
-                    ),
-                    "tone": "Hook",
-                    "status": "rendered",
-                    "localOutput": output,
-                }
-            )
-
-        # IMPORTANT:
-        # Render's local filesystem is temporary. We deliberately do not
-        # expose localOutput as a public download URL.
-        # Persistent S3/R2-compatible storage must be configured next.
-        raise RuntimeError(
-            "MP4 rendering succeeded, but persistent storage is not "
-            "configured. Configure S3-compatible storage before publishing "
-            "download URLs."
-        )
+def claim_job():
+    r = SESSION.post(f"{API_BASE_URL}/api/worker/next", timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    return data if data.get("claimed") else None
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--once", action="store_true")
+    args = parser.parse_args()
+
     while True:
-        job_data = None
-
+        job = None
         try:
-            response = SESSION.post(
-                f"{API_BASE_URL}/api/worker/next",
-                timeout=30,
-            )
-
-            if response.status_code == 204:
+            job = claim_job()
+            if not job:
+                if args.once:
+                    return
                 time.sleep(POLL_SECONDS)
                 continue
-
-            response.raise_for_status()
-            job_data = response.json()
-
-            if not job_data.get("claimed"):
-                time.sleep(POLL_SECONDS)
-                continue
-
-            process(job_data)
-
+            process(job)
+            if args.once:
+                return
         except Exception as exc:
-            print(
-                f"worker error: {exc}",
-                flush=True,
-            )
-
-            job_id = (
-                job_data.get("jobId")
-                if job_data
-                else None
-            )
-
-            if job_id:
+            print(f"worker error: {exc}", flush=True)
+            if job:
                 try:
-                    callback(
-                        job_id,
-                        {
-                            "status": "failed",
-                            "progress": 100,
-                            "step": 4,
-                            "message": "Media processing failed.",
-                            "error": str(exc),
-                        },
-                    )
+                    callback(job["jobId"], {
+                        "status": "failed", "progress": 100, "step": 4,
+                        "message": "Media processing failed.",
+                        "error": str(exc)
+                    })
                 except Exception as callback_error:
-                    print(
-                        f"callback error: {callback_error}",
-                        flush=True,
-                    )
-
+                    print(f"callback error: {callback_error}", flush=True)
+            if args.once:
+                raise
             time.sleep(POLL_SECONDS)
 
 

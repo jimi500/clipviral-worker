@@ -1,0 +1,49 @@
+name: ClipViral Free Media Worker
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clipviral-media-worker
+  cancel-in-progress: false
+
+jobs:
+  process-one-job:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Cache Whisper model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: whisper-base-v1
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Process one ClipViral job
+        env:
+          CLIPVIRAL_API_URL: https://clipforge-ai-dvdwp2.v2.appdeploy.ai
+          WHISPER_MODEL: base
+          MAX_CLIPS: "1"
+          CLIP_SECONDS: "20"
+          OUTPUT_WIDTH: "720"
+          OUTPUT_HEIGHT: "1280"
+        run: python worker.py --once
