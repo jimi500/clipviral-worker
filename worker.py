@@ -10,6 +10,7 @@ import requests
 from faster_whisper import WhisperModel
 
 API_BASE_URL = os.environ["CLIPVIRAL_API_URL"].rstrip("/")
+WORKER_SECRET = os.environ["CLIPVIRAL_WORKER_SECRET"]
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "5"))
 MODEL_NAME = os.getenv("WHISPER_MODEL", "base")
 MAX_CLIPS = int(os.getenv("MAX_CLIPS", "1"))
@@ -18,6 +19,7 @@ OUTPUT_WIDTH = int(os.getenv("OUTPUT_WIDTH", "720"))
 OUTPUT_HEIGHT = int(os.getenv("OUTPUT_HEIGHT", "1280"))
 
 SESSION = requests.Session()
+SESSION.headers.update({"Authorization": f"Bearer {WORKER_SECRET}"})
 MODEL = None
 
 
