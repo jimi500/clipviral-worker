@@ -41,6 +41,7 @@ jobs:
       - name: Process one ClipViral job
         env:
           CLIPVIRAL_API_URL: https://clipforge-ai-dvdwp2.v2.appdeploy.ai
+          CLIPVIRAL_WORKER_SECRET: ${{ secrets.CLIPVIRAL_WORKER_SECRET }}
           WHISPER_MODEL: base
           MAX_CLIPS: "1"
           CLIP_SECONDS: "20"
