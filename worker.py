@@ -18,8 +18,8 @@ CLIP_SECONDS = int(os.getenv("CLIP_SECONDS", "20"))
 OUTPUT_WIDTH = int(os.getenv("OUTPUT_WIDTH", "720"))
 OUTPUT_HEIGHT = int(os.getenv("OUTPUT_HEIGHT", "1280"))
 
-SESSION = requests.Session()
-SESSION.headers.update({"Authorization": f"Bearer {WORKER_SECRET}"})
+SESSION = requests.Session(
+SESSION.headers.update({"X-ClipViral-Worker-Secret": WORKER_SECRET})
 MODEL = None
 
 
